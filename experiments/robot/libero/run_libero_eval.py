@@ -19,6 +19,7 @@ Usage:
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -72,6 +73,13 @@ class GenerateConfig:
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
 
+    # Task-range parameters for parallel execution (None = use full suite range)
+    task_id_start: Optional[int] = None             # First task index to evaluate (inclusive)
+    task_id_end: Optional[int] = None               # Last task index to evaluate (exclusive)
+
+    # GPU assignment for parallel execution (None = use CUDA_VISIBLE_DEVICES as-is)
+    cuda_device_index: Optional[int] = None         # CUDA device index for model inference (0, 1, ...)
+
     #################################################################################################################
     # Utils
     #################################################################################################################
@@ -93,6 +101,17 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if "image_aug" in cfg.pretrained_checkpoint:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+
+    # Configure GPU assignment for parallel execution.
+    # Both CUDA_VISIBLE_DEVICES and MUJOCO_EGL_DEVICE_ID must be set BEFORE importing
+    # robosuite (which validates them at module load time). We set them here early because
+    # draccus already ran the imports; at least the env vars must be set before env creation.
+    # When cuda_device_index is provided we keep all GPUs visible (for EGL on GPU 0) but
+    # steer PyTorch model placement via device_map in get_vla().
+    if cfg.cuda_device_index is not None:
+        # Ensure GPU 0 stays visible for the single EGL device on this system.
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
 
     # Set random seed
     set_seed_everywhere(cfg.seed)
@@ -116,8 +135,17 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
 
+    # Initialize LIBERO task suite early so we can resolve task range for the run_id.
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[cfg.task_suite_name]()
+    num_tasks_in_suite = task_suite.n_tasks
+    task_start = cfg.task_id_start if cfg.task_id_start is not None else 0
+    task_end = cfg.task_id_end if cfg.task_id_end is not None else num_tasks_in_suite
+
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+    if task_start != 0 or task_end != num_tasks_in_suite:
+        run_id += f"--tasks{task_start}-{task_end}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
     os.makedirs(cfg.local_log_dir, exist_ok=True)
@@ -133,19 +161,15 @@ def eval_libero(cfg: GenerateConfig) -> None:
             name=run_id,
         )
 
-    # Initialize LIBERO task suite
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.task_suite_name]()
-    num_tasks_in_suite = task_suite.n_tasks
-    print(f"Task suite: {cfg.task_suite_name}")
-    log_file.write(f"Task suite: {cfg.task_suite_name}\n")
+    print(f"Task suite: {cfg.task_suite_name} (tasks {task_start}–{task_end-1})")
+    log_file.write(f"Task suite: {cfg.task_suite_name} (tasks {task_start}–{task_end-1})\n")
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(range(task_start, task_end)):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -157,6 +181,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
+        t_img_total, t_infer_total, t_env_total, t_steps_counted = 0.0, 0.0, 0.0, 0
         for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
@@ -193,7 +218,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         continue
 
                     # Get preprocessed image
+                    _t0 = time.perf_counter()
                     img = get_libero_image(obs, resize_size)
+                    _t1 = time.perf_counter()
 
                     # Save preprocessed image for replay video
                     replay_images.append(img)
@@ -215,6 +242,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         task_description,
                         processor=processor,
                     )
+                    _t2 = time.perf_counter()
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -226,6 +254,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
+                    _t3 = time.perf_counter()
+
+                    t_img_total += _t1 - _t0
+                    t_infer_total += _t2 - _t1
+                    t_env_total += _t3 - _t2
+                    t_steps_counted += 1
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -239,6 +273,18 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             task_episodes += 1
             total_episodes += 1
+
+            # Print per-step timing breakdown for the first episode of the first task
+            if task_id == 0 and episode_idx == 0 and t_steps_counted > 0:
+                avg_img = t_img_total / t_steps_counted * 1000
+                avg_infer = t_infer_total / t_steps_counted * 1000
+                avg_env = t_env_total / t_steps_counted * 1000
+                avg_total = avg_img + avg_infer + avg_env
+                print(f"\n[TIMING] Per-step averages over {t_steps_counted} steps:")
+                print(f"  Image preprocess : {avg_img:6.1f} ms ({avg_img/avg_total*100:.0f}%)")
+                print(f"  Model inference  : {avg_infer:6.1f} ms ({avg_infer/avg_total*100:.0f}%)")
+                print(f"  Env step         : {avg_env:6.1f} ms ({avg_env/avg_total*100:.0f}%)")
+                print(f"  Total per step   : {avg_total:6.1f} ms  =>  {1000/avg_total:.1f} steps/s")
 
             # Save a replay video of the episode
             save_rollout_video(

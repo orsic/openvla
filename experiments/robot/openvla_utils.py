@@ -40,8 +40,18 @@ def get_vla(cfg):
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
+    # Determine target device. cuda_device_index allows parallel workers to place
+    # models on different GPUs without restricting CUDA_VISIBLE_DEVICES (which would
+    # break EGL rendering, which requires GPU 0 to remain visible on this system).
+    cuda_device_index = getattr(cfg, "cuda_device_index", None)
+    if cuda_device_index is not None:
+        target_device = torch.device(f"cuda:{cuda_device_index}")
+        device_map = {"": cuda_device_index}
+    else:
+        target_device = DEVICE
+        device_map = None
+
+    from_pretrained_kwargs = dict(
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
@@ -49,12 +59,16 @@ def get_vla(cfg):
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    if device_map is not None:
+        from_pretrained_kwargs["device_map"] = device_map
 
-    # Move model to device.
+    vla = AutoModelForVision2Seq.from_pretrained(cfg.pretrained_checkpoint, **from_pretrained_kwargs)
+
+    # Move model to device when device_map is not used.
     # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
     #       already be set to the right devices and casted to the correct dtype upon loading.
-    if not cfg.load_in_8bit and not cfg.load_in_4bit:
-        vla = vla.to(DEVICE)
+    if device_map is None and not cfg.load_in_8bit and not cfg.load_in_4bit:
+        vla = vla.to(target_device)
 
     # Load dataset stats used during finetuning (for action un-normalization).
     dataset_statistics_path = os.path.join(cfg.pretrained_checkpoint, "dataset_statistics.json")

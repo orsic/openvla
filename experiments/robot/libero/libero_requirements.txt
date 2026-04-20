@@ -4,3 +4,10 @@ bddl
 easydict
 cloudpickle
 gym
+accelerate
+flash-attn
+draccus
+tensorflow==2.15.0
+tensorflow-datasets
+tensorflow-graphics
+dlimp @ git+https://github.com/moojink/dlimp_openvla

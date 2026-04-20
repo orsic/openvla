@@ -1,0 +1,38 @@
+timm==0.9.10
+tokenizers==0.19.1
+torch==2.5.1
+torchvision
+transformers==4.40.1
+#
+imageio[ffmpeg]
+robosuite #==1.4.1
+bddl
+easydict
+cloudpickle
+gym
+accelerate
+draccus
+# einops
+# NOTE: flash-attn must be installed with --no-build-isolation:
+#   pip install flash-attn --no-build-isolation
+flash-attn
+# huggingface_hub
+# json-numpy
+# jsonlines
+# lerobot
+# matplotlib
+# peft
+# protobuf
+# rich
+# sentencepiece~=0.1.99
+# timm
+# tokenizers~=0.19.1
+# torch==2.4.0
+# torchvision
+# torchaudio
+# transformers
+# wandb
+# tensorflow==2.*
+# tensorflow_datasets==4.*
+# tensorflow_graphics==2021.*
+# # dlimp @ git+https://github.com/moojink/dlimp_openvla

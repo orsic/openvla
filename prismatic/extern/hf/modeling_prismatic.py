@@ -301,6 +301,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_projector_features: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -332,6 +334,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 attention_mask=None,
                 position_ids=None,
                 past_key_values=past_key_values,
+                cache_position=cache_position,
                 inputs_embeds=None,
                 labels=None,
                 use_cache=use_cache,
@@ -454,7 +457,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        **kwargs: str,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
     ) -> Dict[str, torch.Tensor]:
         """Borrowed from `LlamaForCausalLM` and simplified for batch size = 1; mirrors original PrismaticVLM logic."""
         if ((input_ids is not None) and (input_ids.shape[0] > 1)) or (
@@ -472,13 +476,14 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         else:
             model_inputs = {"input_ids": input_ids}
 
-        # Make sure `pixel_values` are preserved in `model_inputs`
+        # Make sure `pixel_values` and `cache_position` are preserved in `model_inputs`
         model_inputs.update(
             {
                 "attention_mask": attention_mask,
                 "pixel_values": pixel_values,
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
+                "cache_position": cache_position,
             }
         )
 

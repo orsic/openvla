@@ -4,10 +4,12 @@ import math
 import os
 
 import imageio
+import mujoco
 import numpy as np
 import tensorflow as tf
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+from robosuite.utils.binding_utils import MjRenderContext
 
 from experiments.robot.robot_utils import (
     DATE,
@@ -15,11 +17,38 @@ from experiments.robot.robot_utils import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Rendering compatibility patch: mujoco 3.x enables reflections and shadows
+# by default, but mujoco-py 2.x (used during training) had neither.  The
+# metallic/silvery appearance of objects (e.g. "black bowls") in mujoco 3 is
+# caused by mjRND_REFLECTION being on.  Disable both flags so the rendered
+# images stay close to the training distribution.
+# ---------------------------------------------------------------------------
+_orig_mrc_init = MjRenderContext.__init__
+
+
+def _patched_mrc_init(self, sim, offscreen=True, device_id=-1, max_width=640, max_height=480):
+    _orig_mrc_init(self, sim, offscreen=offscreen, device_id=device_id, max_width=max_width, max_height=max_height)
+    self.scn.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+    self.scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+
+
+MjRenderContext.__init__ = _patched_mrc_init
+# ---------------------------------------------------------------------------
+
+
 def get_libero_env(task, model_family, resolution=256):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    env_args = {
+        "bddl_file_name": task_bddl_file,
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+        # Only render the camera used by the policy; skipping robot0_eye_in_hand cuts
+        # per-step rendering time by ~37% (175ms → 111ms on RTX 6000 Ada with EGL).
+        "camera_names": ["agentview"],
+    }
     env = OffScreenRenderEnv(**env_args)
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description

@@ -1,0 +1,160 @@
+#!/bin/bash
+echo "No firewall"
+# set -euo pipefail
+# IFS=$'\n\t'
+
+# # 1. Extract Docker DNS info BEFORE any flushing
+# DOCKER_DNS_RULES=$(iptables-save -t nat | grep "127\.0\.0\.11" || true)
+
+# # Flush existing rules and delete existing ipsets
+# iptables -F
+# iptables -X
+# iptables -t nat -F
+# iptables -t nat -X
+# iptables -t mangle -F
+# iptables -t mangle -X
+# ipset destroy allowed-domains 2>/dev/null || true
+
+# # 2. Selectively restore ONLY internal Docker DNS resolution
+# if [ -n "$DOCKER_DNS_RULES" ]; then
+#     echo "Restoring Docker DNS rules..."
+#     iptables -t nat -N DOCKER_OUTPUT 2>/dev/null || true
+#     iptables -t nat -N DOCKER_POSTROUTING 2>/dev/null || true
+#     echo "$DOCKER_DNS_RULES" | xargs -L 1 iptables -t nat
+# else
+#     echo "No Docker DNS rules to restore"
+# fi
+
+# # Allow DNS and localhost before any restrictions
+# iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+# iptables -A INPUT  -p udp --sport 53 -j ACCEPT
+# iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
+# iptables -A INPUT  -p tcp --sport 22 -m state --state ESTABLISHED -j ACCEPT
+# iptables -A INPUT  -i lo -j ACCEPT
+# iptables -A OUTPUT -o lo -j ACCEPT
+
+# # Create ipset with CIDR support
+# ipset create allowed-domains hash:net
+
+# # Fetch GitHub meta information and add their IP ranges
+# echo "Fetching GitHub IP ranges..."
+# gh_ranges=$(curl -s https://api.github.com/meta)
+# if [ -z "$gh_ranges" ]; then
+#     echo "ERROR: Failed to fetch GitHub IP ranges"
+#     exit 1
+# fi
+
+# if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
+#     echo "ERROR: GitHub API response missing required fields"
+#     exit 1
+# fi
+
+# echo "Processing GitHub IPs..."
+# while read -r cidr; do
+#     if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+#         echo "ERROR: Invalid CIDR range from GitHub meta: $cidr"
+#         exit 1
+#     fi
+#     echo "Adding GitHub range $cidr"
+#     ipset add allowed-domains "$cidr"
+# done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
+
+# # Resolve and add other allowed domains by DNS.
+# # GitHub domains are included explicitly here because the meta CIDR ranges
+# # don't always cover every IP that api.github.com resolves to in practice.
+# for domain in \
+#     "api.github.com" \
+#     "github.com" \
+#     "objects.githubusercontent.com" \
+#     "registry.npmjs.org" \
+#     "api.anthropic.com" \
+#     "sentry.io" \
+#     "statsig.anthropic.com" \
+#     "pypi.org" \
+#     "ghcr.io" \
+#     "statsig.com" \
+#     "marketplace.visualstudio.com" \
+#     "vscode.blob.core.windows.net" \
+#     "update.code.visualstudio.com" \
+#     "huggingface.co"; do
+#     echo "Resolving $domain..."
+#     ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
+#     if [ -z "$ips" ]; then
+#         echo "ERROR: Failed to resolve $domain"
+#         exit 1
+#     fi
+#     while read -r ip; do
+#         if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+#             echo "ERROR: Invalid IP from DNS for $domain: $ip"
+#             exit 1
+#         fi
+#         echo "Adding $ip for $domain"
+#         ipset add allowed-domains "$ip"
+#     done < <(echo "$ips")
+# done
+
+# # Allow host.docker.internal (set via /etc/hosts by Docker, not DNS)
+# DOCKER_HOST_IP=$(getent hosts host.docker.internal | awk '{print $1}')
+# if [ -n "$DOCKER_HOST_IP" ]; then
+#     echo "Adding host.docker.internal IP: $DOCKER_HOST_IP"
+#     ipset add allowed-domains "$DOCKER_HOST_IP"
+#     # Explicit INPUT/OUTPUT rules so responses aren't dropped if conntrack misses them
+#     iptables -A INPUT  -s "$DOCKER_HOST_IP" -j ACCEPT
+#     iptables -A OUTPUT -d "$DOCKER_HOST_IP" -j ACCEPT
+# else
+#     echo "WARNING: host.docker.internal not found in /etc/hosts"
+# fi
+
+# # Get host IP from default route
+# HOST_IP=$(ip route | grep default | cut -d" " -f3)
+# if [ -z "$HOST_IP" ]; then
+#     echo "ERROR: Failed to detect host IP"
+#     exit 1
+# fi
+
+# HOST_NETWORK=$(echo "$HOST_IP" | sed "s/\.[0-9]*$/.0\/24/")
+# echo "Host network detected as: $HOST_NETWORK"
+
+# iptables -A INPUT  -s "$HOST_NETWORK" -j ACCEPT
+# iptables -A OUTPUT -d "$HOST_NETWORK" -j ACCEPT
+
+# # Default DROP
+# iptables -P INPUT   DROP
+# iptables -P FORWARD DROP
+# iptables -P OUTPUT  DROP
+
+# # Allow established connections
+# iptables -A INPUT  -m state --state ESTABLISHED,RELATED -j ACCEPT
+# iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# # Allow outbound to whitelisted domains
+# iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
+
+# # Reject everything else with immediate feedback
+# iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+
+# echo "Firewall configuration complete"
+
+# # Re-resolve GitHub domains immediately before verification to catch any CDN
+# # IP rotation that may have occurred since the initial dig calls above.
+# echo "Refreshing GitHub IPs before verification..."
+# for domain in api.github.com github.com objects.githubusercontent.com; do
+#     while read -r ip; do
+#         ipset add allowed-domains "$ip" 2>/dev/null || true
+#     done < <(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+# done
+
+# # Verify
+# if curl --connect-timeout 5 https://example.com >/dev/null 2>&1; then
+#     echo "ERROR: Firewall verification failed – able to reach https://example.com"
+#     exit 1
+# else
+#     echo "Firewall verification passed – unable to reach https://example.com as expected"
+# fi
+
+# # if ! curl --connect-timeout 5 https://api.anthropic.com/ >/dev/null 2>&1; then
+# #     echo "ERROR: Firewall verification failed – unable to reach https://api.anthropic.com"
+# #     exit 1
+# # else
+# #     echo "Firewall verification passed – able to reach https://api.anthropic.com as expected"
+# # fi

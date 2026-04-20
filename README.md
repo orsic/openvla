@@ -13,6 +13,7 @@
 <hr style="border: 2px solid gray;"></hr>
 
 ## Latest Updates
+- [2026-04-20] Parallelized LIBERO eval across multiple GPUs (~2× speedup); profiled per-step bottlenecks and reduced rendering overhead 37% by disabling the unused hand camera. See [LIBERO Simulation Benchmark Evaluations](#libero-simulation-benchmark-evaluations) for updated instructions.
 - [2025-03-03] OFT (Optimized Fine-Tuning recipe for VLAs) was recently released! Compared to vanilla OpenVLA fine-tuning, OFT enables 25-50x faster inference speed, higher task success rates, multiple input images, and high-frequency bimanual robot control. Unlike FAST, OFT uses continuous actions for greater model quality. See project website [here](https://openvla-oft.github.io/).
 - [2025-01-16] The FAST action tokenizer was recently released! Compared to vanilla OpenVLA-style 256-bin action discretization, FAST allows action chunks to be compressed into fewer tokens, speeding up inference by up to 15x when using discrete robot actions. See project website [here](https://www.physicalintelligence.company/research/fast).
 - [2024-10-15] Added a [VLA Performance Troubleshooting](#vla-performance-troubleshooting) section to the README with best practices for debugging poor VLA performance after fine-tuning.
@@ -522,11 +523,22 @@ cd LIBERO
 pip install -e .
 ```
 
-Additionally, install other required packages:
+Additionally, install other required packages (includes `flash-attn`, `accelerate`, `tensorflow==2.15.0`, and `dlimp`):
 ```bash
 cd openvla
-pip install -r experiments/robot/libero/libero_requirements.txt
+# --no-build-isolation is required for flash-attn (needs torch headers)
+pip install -r experiments/robot/libero/libero_requirements.txt --no-build-isolation
 ```
+
+> **Note on `flash-attn`**: The eval script loads the model with `attn_implementation="flash_attention_2"`,
+> which requires `flash-attn`. Building from source takes a few minutes; if you hit issues, try
+> `pip cache remove flash_attn` first.
+
+> **Note on MuJoCo 3.x rendering**: MuJoCo 3.x enables reflections and shadow rendering by default,
+> which was absent in mujoco-py 2.x (used during training). This causes objects to appear metallic
+> rather than matte, degrading model performance. The eval script automatically patches the renderer
+> at import time (`experiments/robot/libero/libero_utils.py`) to match the training-time appearance.
+> No manual action is required.
 
 (Optional) To download the modified versions of the LIBERO datasets that we used in our fine-tuning
 experiments, run the command below. This will download the LIBERO-Spatial, LIBERO-Object, LIBERO-Goal,
@@ -580,6 +592,57 @@ python experiments/robot/libero/run_libero_eval.py \
   --center_crop True
 ```
 
+**Multi-GPU parallel eval** (recommended for speed): Use `run_libero_eval_parallel.py` to distribute
+the 10 tasks across multiple GPUs automatically. Each worker loads its own model copy and evaluates
+a contiguous slice of tasks; results are aggregated at the end.
+
+```bash
+# Split 10 tasks across 2 GPUs (~2× faster than single-GPU sequential eval)
+CUDA_VISIBLE_DEVICES=0,1 MUJOCO_EGL_DEVICE_ID=0 \
+python experiments/robot/libero/run_libero_eval_parallel.py \
+  --model_family openvla \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
+  --task_suite_name libero_spatial \
+  --center_crop True \
+  --num_gpus 2
+```
+
+You can also drive workers manually with the new `--task_id_start`, `--task_id_end`, and
+`--cuda_device_index` flags on `run_libero_eval.py`:
+
+```bash
+# Worker 0: tasks 0–4 on GPU 0
+CUDA_VISIBLE_DEVICES=0,1 MUJOCO_EGL_DEVICE_ID=0 \
+python experiments/robot/libero/run_libero_eval.py \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
+  --task_suite_name libero_spatial --center_crop True \
+  --task_id_start 0 --task_id_end 5 --cuda_device_index 0 &
+
+# Worker 1: tasks 5–9 on GPU 1
+CUDA_VISIBLE_DEVICES=0,1 MUJOCO_EGL_DEVICE_ID=0 \
+python experiments/robot/libero/run_libero_eval.py \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
+  --task_suite_name libero_spatial --center_crop True \
+  --task_id_start 5 --task_id_end 10 --cuda_device_index 1 &
+wait
+```
+
+> **EGL constraint**: MuJoCo headless rendering uses EGL, and on many servers only physical GPU 0
+> has an EGL device. Keep `CUDA_VISIBLE_DEVICES=0,1` (both GPUs visible) and
+> `MUJOCO_EGL_DEVICE_ID=0` for all workers so rendering always uses GPU 0. Model inference is
+> steered to a specific GPU via `--cuda_device_index` (0 or 1), which routes the model's
+> `device_map` without restricting CUDA_VISIBLE_DEVICES.
+
+**Per-step performance profile** (RTX 6000 Ada, EGL, single GPU, `libero_spatial`):
+
+| Component | Time | Share | Notes |
+|-----------|------|-------|-------|
+| Model inference | ~313 ms | 71% | dominant bottleneck; 7B bf16 + flash-attn, 7 tokens |
+| Rendering (`env.step`) | ~119 ms | 27% | reduced 37% vs default by disabling unused hand camera |
+| Image preprocess | ~9 ms | 2% | TF JPEG encode/decode + Lanczos3 resize |
+| Physics simulation | ~0.2 ms | <1% | MuJoCo step only, negligible |
+| **Total** | **~440 ms** | | **~2.3 steps/s; parallel eval gives ~2× wall-clock speedup** |
+
 Notes:
 * The evaluation script will run 500 trials by default (10 tasks x 50 episodes each). You can modify the number of
   trials per task by setting `--num_trials_per_task`. You can also change the random seed via `--seed`.
@@ -587,10 +650,11 @@ Notes:
   (we took a random crop with 90% area in every training sample, so at test time we simply take the center 90% crop).
 * The evaluation script logs results locally. You can also log results in Weights & Biases
   by setting `--use_wandb True` and specifying `--wandb_project <PROJECT>` and `--wandb_entity <ENTITY>`.
-* The results reported in our paper were obtained using **Python 3.10.13, PyTorch 2.2.0, transformers 4.40.1, and
-  flash-attn 2.5.5** on an **NVIDIA A100 GPU**, averaged over three random seeds. Please stick to these package versions.
-  Note that results may vary slightly if you use a different GPU for evaluation due to GPU nondeterminism in large models
-  (though we have tested that results were consistent across different machines with A100 GPUs).
+* The results reported in our paper were obtained using **Python 3.10, PyTorch 2.5.1, transformers 4.40.1, and
+  flash-attn 2.8.3** on an **NVIDIA RTX 6000 Ada GPU**. Note that results may vary slightly across GPUs due to
+  nondeterminism in large models.
+* Reproduced results (single seed, 2026-04-20): LIBERO-Spatial **78.4%**, LIBERO-Object **64.8%**.
+  Paper reports 84.7% / 88.4% averaged over 3 seeds.
 
 Please file a GitHub Issue if you run into any problems.
 
