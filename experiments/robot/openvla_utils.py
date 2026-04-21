@@ -176,8 +176,9 @@ def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, c
     else:  # OpenVLA
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
-    # Process inputs.
-    inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
+    # Process inputs. Use the model's actual device so parallel workers on non-default GPUs work.
+    model_device = next(vla.parameters()).device
+    inputs = processor(prompt, image).to(model_device, dtype=torch.bfloat16)
 
     # Get action.
     action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)

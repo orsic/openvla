@@ -102,6 +102,11 @@ class FinetuneConfig:
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
                                                                     #   => CAUTION: Reduces memory but hurts performance
 
+    # Dataset type: "rlds" (default Open-X) or "libero_seg" (pre-rendered segmentation HDF5)
+    dataset_type: str = "rlds"                                      # "rlds" | "libero_seg"
+    libero_seg_data_dir: Path = Path("datasets/libero_seg")         # Root dir written by collect_libero_seg_data.py
+    libero_suite: str = "libero_spatial"                            # LIBERO suite name for libero_seg mode
+
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
@@ -126,6 +131,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
         f"+lr-{cfg.learning_rate}"
     )
+    if cfg.dataset_type != "rlds":
+        exp_id += f"+{cfg.dataset_type}"
     if cfg.use_lora:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
     if cfg.use_quantization:
@@ -212,14 +219,23 @@ def finetune(cfg: FinetuneConfig) -> None:
         image_transform=processor.image_processor.apply_transform,
         prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
     )
-    vla_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
-    )
+    if cfg.dataset_type == "libero_seg":
+        from prismatic.vla.datasets.libero_seg_dataset import LiberoSegDataset
+        vla_dataset = LiberoSegDataset(
+            cfg.libero_seg_data_dir,
+            cfg.libero_suite,
+            batch_transform,
+            image_aug=cfg.image_aug,
+        )
+    else:
+        vla_dataset = RLDSDataset(
+            cfg.data_root_dir,
+            cfg.dataset_name,
+            batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            image_aug=cfg.image_aug,
+        )
 
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
@@ -234,7 +250,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         batch_size=cfg.batch_size,
         sampler=None,
         collate_fn=collator,
-        num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
+        # Both RLDS (TFDS) and LiberoSegDataset (IterableDataset) manage their own iteration;
+        # multi-worker DataLoader with IterableDataset duplicates samples across workers.
+        num_workers=0,
     )
 
     # Initialize Logging =>> W&B

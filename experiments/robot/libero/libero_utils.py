@@ -37,7 +37,7 @@ MjRenderContext.__init__ = _patched_mrc_init
 # ---------------------------------------------------------------------------
 
 
-def get_libero_env(task, model_family, resolution=256):
+def get_libero_env(task, model_family, resolution=256, use_segmentation=False):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
@@ -49,6 +49,10 @@ def get_libero_env(task, model_family, resolution=256):
         # per-step rendering time by ~37% (175ms → 111ms on RTX 6000 Ada with EGL).
         "camera_names": ["agentview"],
     }
+    if use_segmentation:
+        # Adds obs["agentview_segmentation*"] with per-pixel geom instance IDs.
+        # Segmentation type list must be the same length as camera_names.
+        env_args["camera_segmentations"] = ["instance"]
     env = OffScreenRenderEnv(**env_args)
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description

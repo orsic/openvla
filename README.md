@@ -13,6 +13,7 @@
 <hr style="border: 2px solid gray;"></hr>
 
 ## Latest Updates
+- [2026-04-21] Added segmentation map input pipeline for LIBERO: GT segmentation, SAM 2 predicted masks, and LoRA fine-tuning on semantic observations. See [Segmentation Map Inputs](#segmentation-map-inputs-research).
 - [2026-04-20] Parallelized LIBERO eval across multiple GPUs (~2× speedup); profiled per-step bottlenecks and reduced rendering overhead 37% by disabling the unused hand camera. See [LIBERO Simulation Benchmark Evaluations](#libero-simulation-benchmark-evaluations) for updated instructions.
 - [2025-03-03] OFT (Optimized Fine-Tuning recipe for VLAs) was recently released! Compared to vanilla OpenVLA fine-tuning, OFT enables 25-50x faster inference speed, higher task success rates, multiple input images, and high-frequency bimanual robot control. Unlike FAST, OFT uses continuous actions for greater model quality. See project website [here](https://openvla-oft.github.io/).
 - [2025-01-16] The FAST action tokenizer was recently released! Compared to vanilla OpenVLA-style 256-bin action discretization, FAST allows action chunks to be compressed into fewer tokens, speeding up inference by up to 15x when using discrete robot actions. See project website [here](https://www.physicalintelligence.company/research/fast).
@@ -597,6 +598,7 @@ the 10 tasks across multiple GPUs automatically. Each worker loads its own model
 a contiguous slice of tasks; results are aggregated at the end.
 
 ```bash
+# Run from the repository root (e.g. cd /source)
 # Split 10 tasks across 2 GPUs (~2× faster than single-GPU sequential eval)
 CUDA_VISIBLE_DEVICES=0,1 MUJOCO_EGL_DEVICE_ID=0 \
 python experiments/robot/libero/run_libero_eval_parallel.py \
@@ -608,12 +610,14 @@ python experiments/robot/libero/run_libero_eval_parallel.py \
 ```
 
 You can also drive workers manually with the new `--task_id_start`, `--task_id_end`, and
-`--cuda_device_index` flags on `run_libero_eval.py`:
+`--cuda_device_index` flags on `run_libero_eval.py`.
+> **Note**: run all commands from the repository root (e.g. `cd /source`).
 
 ```bash
 # Worker 0: tasks 0–4 on GPU 0
 CUDA_VISIBLE_DEVICES=0,1 MUJOCO_EGL_DEVICE_ID=0 \
 python experiments/robot/libero/run_libero_eval.py \
+  --model_family openvla \
   --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
   --task_suite_name libero_spatial --center_crop True \
   --task_id_start 0 --task_id_end 5 --cuda_device_index 0 &
@@ -621,6 +625,7 @@ python experiments/robot/libero/run_libero_eval.py \
 # Worker 1: tasks 5–9 on GPU 1
 CUDA_VISIBLE_DEVICES=0,1 MUJOCO_EGL_DEVICE_ID=0 \
 python experiments/robot/libero/run_libero_eval.py \
+  --model_family openvla \
   --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
   --task_suite_name libero_spatial --center_crop True \
   --task_id_start 5 --task_id_end 10 --cuda_device_index 1 &
@@ -657,6 +662,83 @@ Notes:
   Paper reports 84.7% / 88.4% averaged over 3 seeds.
 
 Please file a GitHub Issue if you run into any problems.
+
+#### Segmentation Map Inputs (Research)
+
+The eval and fine-tuning pipelines support replacing RGB observations with **colorized
+segmentation masks** as a research variant. Three input modes are available via `--input_type`:
+
+| `--input_type` | Source | Use case |
+|----------------|--------|----------|
+| `rgb` (default) | MuJoCo RGB camera | Standard eval |
+| `gt_seg` | MuJoCo instance segmentation | Upper bound — GT semantics |
+| `sam_seg` | SAM 2 predicted masks | Practical bound — predicted semantics |
+
+Each geom instance is assigned a unique, perceptually-distinct color from a 256-entry golden-ratio
+hue palette (no two geoms share a color).
+
+**Smoke-test GT segmentation** (no fine-tuning needed, just verify the rendering):
+```bash
+python experiments/robot/libero/run_libero_eval.py \
+  --model_family openvla \
+  --pretrained_checkpoint openvla/openvla-7b-finetuned-libero-spatial \
+  --task_suite_name libero_spatial --center_crop True \
+  --input_type gt_seg --num_trials_per_task 1
+```
+Rollout videos will show colored segmentation frames. Success rate will be ~0% (the base model
+has never seen segmentation inputs) — this just verifies the pipeline is working.
+
+**Step 1 — collect segmentation training data** (replays existing demos with segmentation
+rendering; one-time cost, ~minutes per suite):
+```bash
+python experiments/robot/libero/collect_libero_seg_data.py \
+    --suite_name libero_spatial \
+    --data_root /opt/LIBERO/datasets \
+    --output_dir datasets/libero_seg
+```
+Output: `datasets/libero_seg/libero_spatial/task_00.h5 … task_09.h5`
+
+Pass `--num_demos 2` for a quick smoke-test before running the full 50 demos.
+
+**Step 2 — LoRA fine-tune on segmentation maps:**
+```bash
+torchrun --standalone --nproc-per-node 4 vla-scripts/finetune.py \
+    --vla_path openvla/openvla-7b-finetuned-libero-spatial \
+    --dataset_type libero_seg \
+    --libero_suite libero_spatial \
+    --libero_seg_data_dir datasets/libero_seg \
+    --run_root_dir runs \
+    --use_lora True --lora_rank 32 \
+    --image_aug False
+```
+The checkpoint is saved to `runs/<exp_id>/` and includes a `dataset_statistics.json` used for
+action de-normalization at eval time.
+
+**Step 3 — evaluate the fine-tuned model:**
+```bash
+python experiments/robot/libero/run_libero_eval.py \
+    --model_family openvla \
+    --pretrained_checkpoint runs/<exp_id> \
+    --task_suite_name libero_spatial \
+    --input_type gt_seg \
+    --center_crop False
+```
+
+**SAM 2 predicted masks** (requires separate install):
+```bash
+pip install git+https://github.com/facebookresearch/sam2.git
+wget https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+
+python experiments/robot/libero/run_libero_eval.py \
+    --model_family openvla \
+    --pretrained_checkpoint runs/<exp_id> \
+    --task_suite_name libero_spatial \
+    --input_type sam_seg \
+    --sam_checkpoint sam2.1_hiera_large.pt
+```
+
+W&B metrics are logged under `success_rate/{input_type}/{task_description}` so all three
+conditions can be compared in a single project.
 
 ---
 

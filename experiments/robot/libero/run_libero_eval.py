@@ -40,6 +40,7 @@ from experiments.robot.libero.libero_utils import (
     quat2axisangle,
     save_rollout_video,
 )
+from experiments.robot.libero.seg_utils import SAMSegHandler, get_libero_seg_image
 from experiments.robot.openvla_utils import get_processor
 from experiments.robot.robot_utils import (
     DATE_TIME,
@@ -80,6 +81,11 @@ class GenerateConfig:
     # GPU assignment for parallel execution (None = use CUDA_VISIBLE_DEVICES as-is)
     cuda_device_index: Optional[int] = None         # CUDA device index for model inference (0, 1, ...)
 
+    # Input modality: rgb (default), gt_seg (GT segmentation), sam_seg (SAM 2 predicted masks)
+    input_type: str = "rgb"                         # "rgb" | "gt_seg" | "sam_seg"
+    sam_checkpoint: Optional[str] = None            # Path to SAM 2 checkpoint (.pt) for sam_seg mode
+    sam_model_cfg: str = "configs/sam2.1/sam2.1_hiera_l.yaml"  # SAM 2 model config path
+
     #################################################################################################################
     # Utils
     #################################################################################################################
@@ -102,15 +108,20 @@ def eval_libero(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
 
+    # Detect torchrun launch (sets LOCAL_RANK / LOCAL_WORLD_SIZE per process).
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    is_torchrun = local_rank >= 0
+    if is_torchrun and cfg.cuda_device_index is None:
+        cfg.cuda_device_index = local_rank
+
     # Configure GPU assignment for parallel execution.
-    # Both CUDA_VISIBLE_DEVICES and MUJOCO_EGL_DEVICE_ID must be set BEFORE importing
-    # robosuite (which validates them at module load time). We set them here early because
-    # draccus already ran the imports; at least the env vars must be set before env creation.
-    # When cuda_device_index is provided we keep all GPUs visible (for EGL on GPU 0) but
-    # steer PyTorch model placement via device_map in get_vla().
+    # MUJOCO_EGL_DEVICE_ID must be set before env creation (EGL device is always 0 on this system).
+    # For subprocess-based parallelism we also pin CUDA_VISIBLE_DEVICES so GPU 0 stays visible for EGL.
+    # Under torchrun all GPUs are already visible, so we skip that override.
     if cfg.cuda_device_index is not None:
-        # Ensure GPU 0 stays visible for the single EGL device on this system.
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
+        if not is_torchrun:
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
         os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
 
     # Set random seed
@@ -142,10 +153,26 @@ def eval_libero(cfg: GenerateConfig) -> None:
     task_start = cfg.task_id_start if cfg.task_id_start is not None else 0
     task_end = cfg.task_id_end if cfg.task_id_end is not None else num_tasks_in_suite
 
+    # Under torchrun with no explicit task range, partition tasks evenly across ranks.
+    if is_torchrun and cfg.task_id_start is None and cfg.task_id_end is None:
+        base, rem = divmod(num_tasks_in_suite, world_size)
+        task_start = local_rank * base + min(local_rank, rem)
+        task_end = task_start + base + (1 if local_rank < rem else 0)
+
+    # Initialize SAM handler lazily (only when needed)
+    sam_handler = None
+    if cfg.input_type == "sam_seg":
+        assert cfg.sam_checkpoint is not None, "--sam_checkpoint must be set when using --input_type sam_seg"
+        sam_handler = SAMSegHandler(cfg.sam_checkpoint, model_cfg=cfg.sam_model_cfg)
+
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+    if is_torchrun:
+        run_id += f"--rank{local_rank}"
     if task_start != 0 or task_end != num_tasks_in_suite:
         run_id += f"--tasks{task_start}-{task_end}"
+    if cfg.input_type != "rgb":
+        run_id += f"--{cfg.input_type}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
     os.makedirs(cfg.local_log_dir, exist_ok=True)
@@ -159,6 +186,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             entity=cfg.wandb_entity,
             project=cfg.wandb_project,
             name=run_id,
+            config={"input_type": cfg.input_type, "task_suite": cfg.task_suite_name},
         )
 
     print(f"Task suite: {cfg.task_suite_name} (tasks {task_start}–{task_end-1})")
@@ -177,7 +205,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
-        env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
+        env, task_description = get_libero_env(
+            task, cfg.model_family, resolution=256, use_segmentation=(cfg.input_type != "rgb")
+        )
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -217,9 +247,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         t += 1
                         continue
 
-                    # Get preprocessed image
+                    # Get preprocessed image (RGB, GT segmentation, or SAM segmentation)
                     _t0 = time.perf_counter()
-                    img = get_libero_image(obs, resize_size)
+                    if cfg.input_type == "rgb":
+                        img = get_libero_image(obs, resize_size)
+                    elif cfg.input_type == "gt_seg":
+                        img = get_libero_seg_image(obs, resize_size)
+                    else:  # sam_seg
+                        img = sam_handler.predict(obs["agentview_image"], resize_size)
                     _t1 = time.perf_counter()
 
                     # Save preprocessed image for replay video
@@ -274,8 +309,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Print per-step timing breakdown for the first episode of the first task
-            if task_id == 0 and episode_idx == 0 and t_steps_counted > 0:
+            # Print per-step timing breakdown for the first episode of the first assigned task
+            if task_id == task_start and episode_idx == 0 and t_steps_counted > 0:
                 avg_img = t_img_total / t_steps_counted * 1000
                 avg_infer = t_infer_total / t_steps_counted * 1000
                 avg_env = t_env_total / t_steps_counted * 1000
@@ -309,7 +344,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         if cfg.use_wandb:
             wandb.log(
                 {
-                    f"success_rate/{task_description}": float(task_successes) / float(task_episodes),
+                    f"success_rate/{cfg.input_type}/{task_description}": float(task_successes) / float(task_episodes),
                     f"num_episodes/{task_description}": task_episodes,
                 }
             )
