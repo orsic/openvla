@@ -153,3 +153,5 @@ rollouts/
 wandb/
 experiments/logs/
 .claude/
+adapter-tmp/
+runs/

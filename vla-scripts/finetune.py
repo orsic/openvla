@@ -51,6 +51,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TF_VISIBLE_DEVICES"] = "-1"  # prevent TF from claiming any GPU; PyTorch is unaffected
 
 
 # # === Utilities ===
@@ -109,7 +110,7 @@ class FinetuneConfig:
 
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
-    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
+    wandb_entity: str = "orsic-university-of-zagreb-faculty-of-electrical-enginee"                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
 
     # fmt: on

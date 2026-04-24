@@ -11,11 +11,6 @@ from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 from robosuite.utils.binding_utils import MjRenderContext
 
-from experiments.robot.robot_utils import (
-    DATE,
-    DATE_TIME,
-)
-
 
 # ---------------------------------------------------------------------------
 # Rendering compatibility patch: mujoco 3.x enables reflections and shadows
@@ -93,6 +88,7 @@ def get_libero_image(obs, resize_size):
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None):
     """Saves an MP4 replay of an episode."""
+    from experiments.robot.robot_utils import DATE, DATE_TIME  # noqa: PLC0415
     rollout_dir = f"./rollouts/{DATE}"
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
