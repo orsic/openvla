@@ -62,17 +62,33 @@ def get_vla(cfg):
     if device_map is not None:
         from_pretrained_kwargs["device_map"] = device_map
 
-    vla = AutoModelForVision2Seq.from_pretrained(cfg.pretrained_checkpoint, **from_pretrained_kwargs)
-
-    # Move model to device when device_map is not used.
-    # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
-    #       already be set to the right devices and casted to the correct dtype upon loading.
-    if device_map is None and not cfg.load_in_8bit and not cfg.load_in_4bit:
-        vla = vla.to(target_device)
+    # Detect LoRA adapter checkpoint (has adapter_config.json but no full model weights).
+    adapter_config_path = os.path.join(cfg.pretrained_checkpoint, "adapter_config.json")
+    if os.path.isfile(adapter_config_path):
+        from peft import PeftModel
+        with open(adapter_config_path, "r") as f:
+            adapter_config = json.load(f)
+        base_model_path = adapter_config["base_model_name_or_path"]
+        print(f"Loading base model from: {base_model_path}")
+        vla = AutoModelForVision2Seq.from_pretrained(base_model_path, **from_pretrained_kwargs)
+        if device_map is None and not cfg.load_in_8bit and not cfg.load_in_4bit:
+            vla = vla.to(target_device)
+        print(f"Applying LoRA adapter from: {cfg.pretrained_checkpoint}")
+        vla = PeftModel.from_pretrained(vla, cfg.pretrained_checkpoint)
+        vla = vla.merge_and_unload()
+    else:
+        vla = AutoModelForVision2Seq.from_pretrained(cfg.pretrained_checkpoint, **from_pretrained_kwargs)
+        if device_map is None and not cfg.load_in_8bit and not cfg.load_in_4bit:
+            vla = vla.to(target_device)
 
     # Load dataset stats used during finetuning (for action un-normalization).
-    dataset_statistics_path = os.path.join(cfg.pretrained_checkpoint, "dataset_statistics.json")
-    if os.path.isfile(dataset_statistics_path):
+    # For LoRA adapter checkpoints, stats live in the parent run directory.
+    from pathlib import Path as _Path
+    ckpt_path = _Path(cfg.pretrained_checkpoint)
+    dataset_statistics_path = ckpt_path / "dataset_statistics.json"
+    if not dataset_statistics_path.is_file():
+        dataset_statistics_path = ckpt_path.parent / "dataset_statistics.json"
+    if dataset_statistics_path.is_file():
         with open(dataset_statistics_path, "r") as f:
             norm_stats = json.load(f)
         vla.norm_stats = norm_stats
@@ -88,7 +104,17 @@ def get_vla(cfg):
 
 def get_processor(cfg):
     """Get VLA model's Hugging Face processor."""
-    processor = AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
+    from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor
+    # For LoRA adapter checkpoints, the processor is saved in the parent run directory.
+    from pathlib import Path
+    processor_path = Path(cfg.pretrained_checkpoint)
+    if (processor_path / "adapter_config.json").is_file():
+        processor_path = processor_path.parent
+    processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
+    # Ensure our local apply_transform_dual method is available regardless of which cached
+    # processing_prismatic.py was loaded by trust_remote_code.
+    if not hasattr(processor.image_processor, "apply_transform_dual"):
+        type(processor.image_processor).apply_transform_dual = PrismaticImageProcessor.apply_transform_dual
     return processor
 
 
@@ -178,7 +204,18 @@ def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, c
 
     # Process inputs. Use the model's actual device so parallel workers on non-default GPUs work.
     model_device = next(vla.parameters()).device
-    inputs = processor(prompt, image).to(model_device, dtype=torch.bfloat16)
+
+    # If pre-computed pixel_values are provided (e.g. for seg+depth dual inputs), inject them
+    # directly instead of going through the processor's single-image transform path.
+    if "pixel_values" in obs:
+        text_inputs = processor.tokenizer(prompt, return_tensors="pt")
+        inputs = {
+            "input_ids": text_inputs["input_ids"].to(model_device, dtype=torch.long),
+            "attention_mask": text_inputs["attention_mask"].to(model_device),
+            "pixel_values": obs["pixel_values"].unsqueeze(0).to(model_device, dtype=torch.bfloat16),
+        }
+    else:
+        inputs = processor(prompt, image).to(model_device, dtype=torch.bfloat16)
 
     # Get action.
     action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)

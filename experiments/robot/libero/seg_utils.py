@@ -70,6 +70,38 @@ def _get_seg_obs(obs: dict) -> np.ndarray:
     )
 
 
+def get_libero_depth_image(obs: dict, resize_size) -> np.ndarray:
+    """Extract and resize a depth map from a LIBERO observation.
+
+    Requires the env to be created with use_depth=True. Robosuite's `agentview_depth`
+    is already in normalized device coordinates [0, 1] (0 = near plane, 1 = far plane),
+    so we map it directly to uint8 without per-frame rescaling. This keeps the same
+    physical depth at the same pixel value across timesteps — a precondition for the
+    model to learn absolute depth cues.
+
+    Args:
+        obs: observation dict from env.step() / env.set_init_state()
+        resize_size: int or (H, W) tuple — target image size
+
+    Returns:
+        uint8 numpy array of shape (*resize_size, 3) — grayscale depth as 3-channel image
+    """
+    from experiments.robot.libero.libero_utils import resize_image
+
+    if isinstance(resize_size, int):
+        resize_size = (resize_size, resize_size)
+
+    depth = obs["agentview_depth"]  # (H, W, 1) float32 in [0, 1] NDC
+    if depth.ndim == 3:
+        depth = depth[..., 0]  # (H, W)
+
+    depth_u8 = np.clip(depth * 255.0, 0, 255).astype(np.uint8)  # (H, W)
+    img = np.stack([depth_u8, depth_u8, depth_u8], axis=2)  # (H, W, 3)
+    img = img[::-1, ::-1]  # rotate 180° to match seg preprocessing
+    img = resize_image(img, resize_size)
+    return img
+
+
 def get_libero_seg_image(obs: dict, resize_size) -> np.ndarray:
     """Extract, colorize, and resize a segmentation mask from a LIBERO observation.
 

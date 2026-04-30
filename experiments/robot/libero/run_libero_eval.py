@@ -28,6 +28,7 @@ import draccus
 import numpy as np
 import tqdm
 from libero.libero import benchmark
+from PIL import Image
 
 import wandb
 
@@ -40,7 +41,7 @@ from experiments.robot.libero.libero_utils import (
     quat2axisangle,
     save_rollout_video,
 )
-from experiments.robot.libero.seg_utils import SAMSegHandler, get_libero_seg_image
+from experiments.robot.libero.seg_utils import SAMSegHandler, get_libero_depth_image, get_libero_seg_image
 from experiments.robot.openvla_utils import get_processor
 from experiments.robot.robot_utils import (
     DATE_TIME,
@@ -81,8 +82,9 @@ class GenerateConfig:
     # GPU assignment for parallel execution (None = use CUDA_VISIBLE_DEVICES as-is)
     cuda_device_index: Optional[int] = None         # CUDA device index for model inference (0, 1, ...)
 
-    # Input modality: rgb (default), gt_seg (GT segmentation), sam_seg (SAM 2 predicted masks)
-    input_type: str = "rgb"                         # "rgb" | "gt_seg" | "sam_seg"
+    # Input modality: rgb (default), gt_seg (GT segmentation), sam_seg (SAM 2 predicted masks),
+    #                 gt_seg_depth (GT segmentation + rendered depth, dual-backbone)
+    input_type: str = "rgb"                         # "rgb" | "gt_seg" | "sam_seg" | "gt_seg_depth"
     sam_checkpoint: Optional[str] = None            # Path to SAM 2 checkpoint (.pt) for sam_seg mode
     sam_model_cfg: str = "configs/sam2.1/sam2.1_hiera_l.yaml"  # SAM 2 model config path
 
@@ -206,7 +208,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
         # Initialize LIBERO environment and task description
         env, task_description = get_libero_env(
-            task, cfg.model_family, resolution=256, use_segmentation=(cfg.input_type != "rgb")
+            task,
+            cfg.model_family,
+            resolution=256,
+            use_segmentation=(cfg.input_type != "rgb"),
+            use_depth=(cfg.input_type == "gt_seg_depth"),
         )
 
         # Start episodes
@@ -225,6 +231,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Setup
             t = 0
             replay_images = []
+            debug_frames = []  # side-by-side seg+depth frames for gt_seg_depth mode
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -247,12 +254,22 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         t += 1
                         continue
 
-                    # Get preprocessed image (RGB, GT segmentation, or SAM segmentation)
+                    # Get preprocessed image (RGB, GT segmentation, SAM segmentation, or seg+depth)
                     _t0 = time.perf_counter()
                     if cfg.input_type == "rgb":
                         img = get_libero_image(obs, resize_size)
                     elif cfg.input_type == "gt_seg":
                         img = get_libero_seg_image(obs, resize_size)
+                    elif cfg.input_type == "gt_seg_depth":
+                        seg_pil = Image.fromarray(get_libero_seg_image(obs, resize_size))
+                        depth_pil = Image.fromarray(get_libero_depth_image(obs, resize_size))
+                        pixel_values = processor.image_processor.apply_transform_dual(seg_pil, depth_pil)
+                        img = np.array(seg_pil)  # for replay video: show seg
+                        # Build side-by-side debug frame: seg | depth-magma
+                        import matplotlib.cm as _cm
+                        depth_gray = np.array(depth_pil)[:, :, 0].astype(np.float32) / 255.0
+                        depth_magma = (_cm.magma(depth_gray)[:, :, :3] * 255).astype(np.uint8)
+                        debug_frames.append(np.concatenate([img, depth_magma], axis=1))
                     else:  # sam_seg
                         img = sam_handler.predict(obs["agentview_image"], resize_size)
                     _t1 = time.perf_counter()
@@ -268,6 +285,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
                         ),
                     }
+                    if cfg.input_type == "gt_seg_depth":
+                        observation["pixel_values"] = pixel_values
 
                     # Query model to get action
                     action = get_action(
@@ -286,6 +305,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
                     if cfg.model_family == "openvla":
                         action = invert_gripper_action(action)
+                        print(f"t={t} gripper={action[-1]:.1f}")  # +1=close, -1=open
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
@@ -325,6 +345,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
             save_rollout_video(
                 replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file
             )
+            if debug_frames:
+                save_rollout_video(
+                    debug_frames, total_episodes, success=done,
+                    task_description=f"{task_description}--debug_seg_depth", log_file=log_file
+                )
 
             # Log current results
             print(f"Success: {done}")

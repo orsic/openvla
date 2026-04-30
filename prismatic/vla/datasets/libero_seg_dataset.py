@@ -37,6 +37,10 @@ class LiberoSegDataset(IterableDataset):
       - An IterableDataset (no __len__ required for infinite loops)
       - A .dataset_statistics attribute with q01/q99 action bounds
       - Items of the form dict(pixel_values, input_ids, labels, dataset_name)
+
+    When the HDF5 files contain a 'depths' dataset (produced by collect_libero_seg_data.py
+    with use_depth=True), depth maps are loaded and combined with segmentation images via
+    apply_transform_dual so that each backbone sees a different modality.
     """
 
     def __init__(
@@ -46,12 +50,14 @@ class LiberoSegDataset(IterableDataset):
         batch_transform: RLDSBatchTransform,
         image_aug: bool = False,
         shuffle: bool = True,
+        image_transform=None,
     ) -> None:
         self.data_dir = Path(data_dir) / suite_name
         self.suite_name = suite_name
         self.batch_transform = batch_transform
         self.image_aug = image_aug
         self.shuffle = shuffle
+        self.image_transform = image_transform  # if set, used instead of batch_transform's image path
 
         hdf5_paths = sorted(self.data_dir.glob("task_*.h5"))
         if not hdf5_paths:
@@ -93,13 +99,15 @@ class LiberoSegDataset(IterableDataset):
                 with h5py.File(path, "r") as f:
                     images = f[f"demos/{demo_key}/images"][:]   # (T, H, W, 3) uint8
                     actions = f[f"demos/{demo_key}/actions"][:] # (T, 7) float32
+                    has_depth = f"demos/{demo_key}/depths" in f
+                    depths = f[f"demos/{demo_key}/depths"][:] if has_depth else None  # (T, H, W, 3) uint8 or None
 
                 step_order = list(range(len(images)))
                 if self.shuffle:
                     random.shuffle(step_order)
 
                 for t in step_order:
-                    img = Image.fromarray(images[t])
+                    seg_img = Image.fromarray(images[t])
                     action = actions[t]
 
                     # Reuse RLDSBatchTransform to keep tokenization consistent.
@@ -107,7 +115,15 @@ class LiberoSegDataset(IterableDataset):
                     rlds_batch = {
                         "dataset_name": self.suite_name.encode(),
                         "action": action[None, :],              # (1, 7) — batch_transform indexes [0]
-                        "observation": {"image_primary": [np.array(img)]},
+                        "observation": {"image_primary": [np.array(seg_img)]},
                         "task": {"language_instruction": language.encode()},
                     }
-                    yield self.batch_transform(rlds_batch)
+                    item = self.batch_transform(rlds_batch)
+
+                    # When depth is available and an image_transform supporting dual inputs is
+                    # provided, replace pixel_values with the seg+depth fused representation.
+                    if has_depth and self.image_transform is not None:
+                        depth_img = Image.fromarray(depths[t])
+                        item["pixel_values"] = self.image_transform(seg_img, depth_img)
+
+                    yield item

@@ -162,7 +162,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
     # Load OpenVLA Processor and Model using HF AutoClasses
+    from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor as _PIP
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    if not hasattr(processor.image_processor, "apply_transform_dual"):
+        type(processor.image_processor).apply_transform_dual = _PIP.apply_transform_dual
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
@@ -227,6 +230,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg.libero_suite,
             batch_transform,
             image_aug=cfg.image_aug,
+            image_transform=processor.image_processor.apply_transform_dual,
         )
     else:
         vla_dataset = RLDSDataset(
@@ -238,8 +242,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             image_aug=cfg.image_aug,
         )
 
-    # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
+    # Save processor and dataset statistics to run_dir once — these are shared across all checkpoints.
     if distributed_state.is_main_process:
+        processor.save_pretrained(run_dir)
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
 
     # Create Collator and DataLoader
@@ -336,50 +341,25 @@ def finetune(cfg: FinetuneConfig) -> None:
                 optimizer.zero_grad()
                 progress.update()
 
-            # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
+            # Save Model Checkpoint
             if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
                 if distributed_state.is_main_process:
                     print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 
-                    # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-                    save_dir = adapter_dir if cfg.use_lora else run_dir
-
-                    # Save Processor & Weights
-                    processor.save_pretrained(run_dir)
-                    vla.module.save_pretrained(save_dir)
-
-                # Wait for processor and adapter weights to be saved by main process
-                dist.barrier()
-
-                # Merge LoRA weights into model backbone for faster inference
-                #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
-                    base_vla = AutoModelForVision2Seq.from_pretrained(
-                        cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-                    )
-                    merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-                    merged_vla = merged_vla.merge_and_unload()
-                    if distributed_state.is_main_process:
+                    if cfg.use_lora:
+                        # Save only adapter weights — base model is loaded from cfg.vla_path at eval time.
+                        # Processor and dataset_statistics live in run_dir (saved once before training).
                         if cfg.save_latest_checkpoint_only:
-                            # Overwrite latest checkpoint
-                            merged_vla.save_pretrained(run_dir)
-
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
+                            adapter_save_dir = run_dir / "latest_adapter"
                         else:
-                            # Prepare to save checkpoint in new directory
-                            checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
-                            os.makedirs(checkpoint_dir, exist_ok=True)
+                            adapter_save_dir = run_dir / f"step_{gradient_step_idx}_adapter"
+                        os.makedirs(adapter_save_dir, exist_ok=True)
+                        vla.module.save_pretrained(adapter_save_dir)
+                        print(f"Saved LoRA adapter for Step {gradient_step_idx} at: {adapter_save_dir}")
+                    else:
+                        vla.module.save_pretrained(run_dir)
+                        print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
 
-                            # Save dataset statistics to new directory
-                            save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
-
-                            # Save processor and model weights to new directory
-                            processor.save_pretrained(checkpoint_dir)
-                            merged_vla.save_pretrained(checkpoint_dir)
-
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
-
-                # Block on Main Process Checkpointing
                 dist.barrier()
 
             # Stop training when max_steps is reached

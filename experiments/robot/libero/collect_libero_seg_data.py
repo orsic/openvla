@@ -35,7 +35,7 @@ from libero.libero import benchmark, get_libero_path
 sys.path.insert(0, str(Path(__file__).parents[3]))  # repo root
 
 from experiments.robot.libero.libero_utils import get_libero_env
-from experiments.robot.libero.seg_utils import get_libero_seg_image
+from experiments.robot.libero.seg_utils import get_libero_depth_image, get_libero_seg_image
 
 
 def find_demo_hdf5(data_root: Path, suite_name: str, task) -> Path:
@@ -76,7 +76,7 @@ def collect_task(
     initial_states = task_suite.get_task_init_states(task_id)
     language = task.language
 
-    env, _ = get_libero_env(task, model_family="openvla", resolution=256, use_segmentation=True)
+    env, _ = get_libero_env(task, model_family="openvla", resolution=256, use_segmentation=True, use_depth=True)
 
     with h5py.File(hdf5_path, "r") as src, h5py.File(output_path, "w") as dst:
         dst.attrs["language"] = language
@@ -92,10 +92,10 @@ def collect_task(
             env.reset()
             obs = env.set_init_state(initial_states[demo_idx])
 
-            images, saved_actions = [], []
+            images, depths, saved_actions = [], [], []
             for action in actions:
-                img = get_libero_seg_image(obs, resize_size=resize)
-                images.append(img)
+                images.append(get_libero_seg_image(obs, resize_size=resize))
+                depths.append(get_libero_depth_image(obs, resize_size=resize))
                 saved_actions.append(action.copy())
                 obs, _reward, done, _info = env.step(action.tolist())
                 if done:
@@ -106,6 +106,7 @@ def collect_task(
 
             grp = demos_grp.create_group(f"demo_{demo_idx}")
             grp.create_dataset("images", data=np.stack(images), dtype=np.uint8, compression="lzf")
+            grp.create_dataset("depths", data=np.stack(depths), dtype=np.uint8, compression="lzf")
             grp.create_dataset("actions", data=np.stack(saved_actions), dtype=np.float32)
 
     env.close()

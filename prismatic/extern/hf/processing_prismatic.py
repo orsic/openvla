@@ -144,6 +144,33 @@ class PrismaticImageProcessor(ImageProcessingMixin):
 
         return img_t
 
+    def apply_transform_dual(self, img1: Image.Image, img2: Image.Image) -> torch.Tensor:
+        """Dispatch each modality to its own backbone: depth → DINO, seg → SigLIP.
+
+        The fused vision backbone splits pixel_values along channels [0:3]→DINO (featurizer)
+        and [3:6]→SigLIP (fused_featurizer). Index 0 of tvf_*_params is DINO, index 1 is SigLIP.
+
+        Args:
+            img1: segmentation RGB image → SigLIP
+            img2: depth image (3-channel grayscale) → DINO
+
+        Returns: Tensor of shape (6, H, W) — channel-stacked, same format as apply_transform.
+        """
+        assert len(self.input_sizes) == 2, "apply_transform_dual requires a fused (dual) vision backbone"
+
+        # Per-backbone inputs: index 0 = DINO (depth), index 1 = SigLIP (seg).
+        per_backbone_inputs = [img2.convert("RGB"), img1.convert("RGB")]
+
+        imgs_t = []
+        for idx in range(2):
+            img_idx = per_backbone_inputs[idx]
+            img_idx = TVF.resize(img_idx, **self.tvf_resize_params[idx])
+            img_idx = TVF.center_crop(img_idx, **self.tvf_crop_params[idx])
+            img_idx_t = TVF.to_tensor(img_idx)
+            img_idx_t = TVF.normalize(img_idx_t, **self.tvf_normalize_params[idx])
+            imgs_t.append(img_idx_t)
+        return torch.vstack(imgs_t)
+
     def preprocess(
         self,
         images: Union[Image.Image, List[Image.Image]],
